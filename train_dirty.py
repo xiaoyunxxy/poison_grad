@@ -65,6 +65,12 @@ if __name__ == "__main__":
     parser.add_argument('--poison_type', default='C', choices=['C', 'P1', 'P2', 'P3', 'P4', 'P5', 'TAP'])
     parser.add_argument('--ex_des', default='', type=str)
 
+    parser.add_argument('--hsic', action='store_true')
+    parser.set_defaults(hsic=False)
+
+    parser.add_argument('--lx', default=0.008, type=float, help='regular for I(X,T)')
+    parser.add_argument('--ly', default=0.08, type=float, help='regular for I(Y,T)')
+
     parser.add_argument('--gpuid', default=0, type=int)
 
     args = parser.parse_args()

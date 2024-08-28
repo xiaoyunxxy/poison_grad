@@ -90,24 +90,24 @@ class CIFAR10grad(Dataset):
         self.c10 = datasets.CIFAR10(root, train=True)
         self.targets = self.c10.targets
 
-        img2poi = dict()
-        with open('results/ResNet18-grad-Linf-eps16.00000/poison_ids.txt', 'r') as f:
-            for i, line in enumerate(f):
-                img2poi[int(line)] = i
-        self.poi_ids = img2poi.keys()
-        self.img2poi = img2poi
-        self.poison_delta = torch.load('../data/CIFAR10Poison/Linf.grad').detach().cpu()
+        if non_poison_indices is not None:
+            self.non_poison_indices = non_poison_indices
+        else:
+            np.random.seed(seed)
+            self.non_poison_indices = np.random.choice(range(50000), int((1 - poison_rate)*50000), replace=False)
+
+        self.poison_data = torch.load('../data/CIFAR10Poison/Linf.grad.24.0')[0]
         self.totensor = transforms.Compose([transforms.ToTensor()])
         self.toimg = transforms.Compose([transforms.ToPILImage()])
 
     def __getitem__(self, index):
-        if index in self.poi_ids:
-            target = self.targets[index]
-            img = self.totensor(self.c10[index][0]) + self.poison_delta[self.img2poi[index]]
-            img = self.toimg(img)
-        else:
+        if index in self.non_poison_indices:
             target = self.targets[index]
             img = self.c10[index][0]
+        else:
+            target = self.targets[index]
+            img = self.poison_data[index]
+            img = self.toimg(img)
 
         if self.transform is not None:
             img = self.transform(img)

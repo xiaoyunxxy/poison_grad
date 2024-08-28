@@ -10,6 +10,7 @@ import os
 from tqdm import tqdm
 from pprint import pprint
 import numpy as np
+from copy import deepcopy 
 
 from utils import set_seed, CIFAR10Poisoned, AverageMeter, accuracy_top1, transform_test, make_and_restore_model
 from attacks.step import LinfStep, L2Step
@@ -24,54 +25,25 @@ STEPS = {
 }
 
 
-def save_data_ids(poisoned_ids, targeted_ids):
 
-    img2poi = dict()
-    count = 0
-    dir_poison = os.path.join(os.path.join(args.out_dir, args.exp_name), './poison_ids.txt')
-    with open(dir_poison, 'w') as f:
-        for i in poisoned_ids:
-            f.write(str(i)+'\n')
-            img2poi[i] = count
-            count += 1
-
-    dir_target = os.path.join(os.path.join(args.out_dir, args.exp_name), './target_ids.txt')
-    with open(dir_target, 'w') as f:
-        for i in targeted_ids:
-            f.write(str(i)+'\n')
-
-    return img2poi
+def label_project(labels):
+    projection = [2,9,4,5,2,3,3,5,0,1]
+    new_labels = deepcopy(labels)
+    for i in range(len(labels)):
+        new_labels[i] = projection[labels[i]]
+    return new_labels
 
 
-def get_data(args):
-    np.random.seed(args.seed)
-
-    poisoned_ids = np.random.choice(range(50000), int(args.poison_rate*50000), replace=False)
-    targeted_ids = np.random.choice(range(10000), int(args.batch_size), replace=False) # take a batch size of test data as target
-
-    img2poi = save_data_ids(poisoned_ids, targeted_ids)
+def gradient_poison(args, model, dirty_model, writer):
+    poisoned_input = torch.empty(50000, args.input_channel, args.input_size, args.input_size)
+    clean_target = torch.empty(50000).long()
 
     train_set = CIFAR10('../data/', train=True, transform=transform_test)
     test_set = CIFAR10('../data/', train=False, transform=transform_test)
 
-    poison_set = torch.utils.data.Subset(train_set, poisoned_ids)
-    target_set = torch.utils.data.Subset(test_set, targeted_ids)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, num_workers=8, drop_last=False, shuffle=True)
 
-    return poison_set, target_set, img2poi
-
-
-def gradient_poison(args, model, dirty_model, writer):
-    poison_set, target_set, img2poi = get_data(args)
-
-    target_data = DataLoader(target_set, batch_size=args.batch_size, num_workers=8)
-    # use a batch of data as target
-    target_inputs = next(iter(target_data))[0].cuda(non_blocking=True)
-    target_labels = next(iter(target_data))[1].cuda(non_blocking=True)
-    target_labels = (target_labels+1)%10
-
-    poison_loader = DataLoader(poison_set, batch_size=args.batch_size, num_workers=8, drop_last=True, shuffle=True)
-
-    poison_delta = torch.empty(int(args.poison_rate*50000), args.input_channel, args.input_size, args.input_size).uniform_(
+    poison_delta = torch.empty(50000, args.input_channel, args.input_size, args.input_size).uniform_(
                 -args.eps, args.eps
             )
     poison_delta = torch.nn.Parameter(poison_delta.clone().detach().requires_grad_(True).cuda(non_blocking=True))
@@ -84,31 +56,31 @@ def gradient_poison(args, model, dirty_model, writer):
         scheduler = torch.optim.lr_scheduler.MultiStepLR(att_optimizer, milestones=[args.attackiter // 2.667, args.attackiter // 1.6,
                                                                                     args.attackiter // 1.142], gamma=0.1)
     
-
     criterion = torch.nn.CrossEntropyLoss().cuda()
 
-    # calculate target gradient
-    target_grad, _ = gradient(model, target_inputs, target_labels, criterion)
-
     for step in range(args.attackiter):
-        target_losses = 0
-        poison_correct = 0
-
         att_optimizer.zero_grad()
         poison_delta.grad = torch.zeros_like(poison_delta)
 
-        for batch, batch_sample in enumerate(poison_loader):
+        for batch, batch_sample in enumerate(train_loader):
             inputs, labels, ids = batch_sample # __getitem__ return img, target, index
-            poi_ids = get_poison_ids(ids, img2poi) 
 
-            delta_slice = poison_delta[poi_ids].detach().cuda(non_blocking=True)
+            delta_slice = poison_delta[ids].detach().cuda(non_blocking=True)
             delta_slice.requires_grad_()
 
             inputs = inputs.cuda(non_blocking=True)
             labels = labels.cuda(non_blocking=True)
 
-            inp_grad, _ = gradient(model, inputs+delta_slice, labels, criterion, re_graph=True)
-            loss = grad_loss(inp_grad, target_grad)
+            # dirty_label = torch.remainder(labels+1, 10)
+            dirty_label = label_project(labels)
+            poison_input = torch.clamp(inputs+delta_slice, 0, 1)
+
+            output = model(poison_input)
+            ce_loss = criterion(output, dirty_label)
+
+            inp_grad, _ = gradient(model, poison_input, labels, criterion, re_graph=True)
+            dir_inp_grad, _ = gradient(model, inputs, dirty_label, criterion, re_graph=True)
+            loss = grad_loss(inp_grad, dir_inp_grad) + ce_loss
 
             print('Step: {:d} loss: {:.4f}'.format(step, loss))
 
@@ -116,7 +88,7 @@ def gradient_poison(args, model, dirty_model, writer):
             loss.backward()
             # poison_delta.grad.sign_() # FGSM-style optimization with sign
 
-            poison_delta.grad[poi_ids] = delta_slice.grad.detach()
+            poison_delta.grad[ids] = delta_slice.grad.detach()
 
             att_optimizer.step()
             if args.scheduling:
@@ -125,12 +97,27 @@ def gradient_poison(args, model, dirty_model, writer):
             with torch.no_grad():
                 # Projection Step
                 poison_delta.data = torch.clamp(poison_delta, min=-args.eps, max=args.eps)
-                poison_imgs = inputs.detach()+poison_delta[poi_ids].detach()
+                poison_imgs = inputs.detach()+poison_delta[ids].detach()
                 poison_imgs = torch.clamp(poison_imgs, min=0, max=1)
                 delta_slice.data = poison_imgs.detach() - inputs.detach()
-                poison_delta[poi_ids] = delta_slice.detach()
+                poison_delta[ids] = delta_slice.detach()
+        print('----- ', poison_delta[0][0][0])
 
-    return poison_delta
+    for batch, batch_sample in enumerate(train_loader):
+        inputs, labels, ids = batch_sample # __getitem__ return img, target, index
+
+        delta_slice = poison_delta[ids].detach().cuda(non_blocking=True)
+
+        inputs = inputs.cuda(non_blocking=True)
+        labels = labels.cuda(non_blocking=True)
+
+        poison_input = torch.clamp(inputs+delta_slice, 0, 1)
+        
+        poisoned_input[ids] = poison_input.detach().cpu()
+        clean_target[ids] = labels.detach().cpu()
+
+
+    return poisoned_input, clean_target
 
 
 def get_poison_ids(img_ids, img2poi):
@@ -230,11 +217,11 @@ def main(args):
     data_loader = DataLoader(data_set, batch_size=args.batch_size, shuffle=False)
 
     model = make_and_restore_model(args.arch, resume_path=args.model_path)
-    dirty_model = make_and_restore_model(args.arch, resume_path=args.dirty_model_path)
+    # dirty_model = make_and_restore_model(args.arch, resume_path=args.dirty_model_path)
     model.eval()
     writer = SummaryWriter(args.tensorboard_path)
 
-    poisoning(args, data_loader, model, writer, dirty_model=dirty_model)
+    poisoning(args, data_loader, model, writer)
     
     # visualization(args, writer)
 
@@ -281,7 +268,7 @@ if __name__ == "__main__":
     args.poison_data_path = os.path.expanduser(args.poison_data_path)
     if not os.path.exists(args.poison_data_path):
         os.makedirs(args.poison_data_path)
-    args.poison_file_path = os.path.join(args.poison_data_path, '{}.{}'.format(args.constraint, args.poison_type.lower()))
+    args.poison_file_path = os.path.join(args.poison_data_path, '{}.{}.{:.1f}'.format(args.constraint, args.poison_type.lower(), args.eps*255))
 
     pprint(vars(args))
 
